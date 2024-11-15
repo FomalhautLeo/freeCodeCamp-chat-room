@@ -1,33 +1,59 @@
-require('dotenv').config();
-const bcrypt = require('bcrypt');
-const passport = require('passport');
-const LocalStrategy = require('passport-local');
-const GitHubStrategy = require('passport-github').Strategy;
-const { ObjectID } = require('mongodb');
+import dotenv from 'dotenv';
+import passport from 'passport';
+import bcrypt from 'bcrypt';
+import { ObjectId } from 'mongodb';
+import LocalStrategy from 'passport-local';
+import passportGithub from 'passport-github';
+import debug from 'debug';
 
-module.exports = function (app, myDataBase) {
+const log = debug('my-app');
+
+dotenv.config();
+const GitHubStrategy = passportGithub.Strategy;
+
+export default function (app, myDataBase) {
 
   passport.serializeUser((user, done) => {
-    done(null, user._id);
+    log(`-- Serializing user: ${user}`);
+    done(null, user._id.toString());
   });
-  passport.deserializeUser((id, done) => {
-    myDataBase.findOne({ _id: new ObjectID(id) }, (err, doc) => {
-      console.log(`-- Find user '${doc.username}'...`)
-      done(null, doc);
-    });
+  passport.deserializeUser(async (id, done) => {
+    try {
+      log(`-- Deserialzing id: ${id}`);
+      const user = await myDataBase.findOne({ _id: ObjectId.createFromHexString(id) });
+      if (!user) {
+        console.log(`-- ID '${id}' not found.`);
+        done(null, false);
+      }
+      log(`--   find user '${user.username}'...`)
+      done(null, user);
+    } catch (err) {
+      console.error(`** Error during deserialize id: ${id}`, err.stack);
+      return done(err);
+    }
   });
 
-  passport.use(new LocalStrategy((username, password, done) => {
-    myDataBase.findOne({ username: username }, (err, user) => {
-      console.log(`User ${username} attempted to log in.`);
-      if (err) return done(err);
-      console.log(`-- Checking user '${username}'...`);
-      if (!user) return done(null, false);
-      console.log("-- Checking passwd...");
-      if (!bcrypt.compareSync(password, user.password)) return done(null, false);
-      console.log("-- Local auth passed.");
+  passport.use(new LocalStrategy(async (username, password, done) => {
+    try {
+      console.log(`-- User ${username} attempted to log in.`);
+      const user = await myDataBase.findOne({ username: username });
+      log(`-- Checking user '${username}'...`);
+      if (!user) {
+        console.log(`-- User '${username}' not found.`);
+        return done(null, false);
+      }
+      log("-- Checking passwd...");
+      const passwdMatch = await bcrypt.compare(password, user.password);
+      if (!passwdMatch) {
+        console.log(`-- Incorrect password for '${username}'.`);
+        return done(null, false);
+      }
+      log("-- Local auth passed.");
       return done(null, user);
-    });
+    } catch (err) {
+      console.error("** Error during authentication:", err);
+      return done(err);
+    }
   }));
 
   passport.use(new GitHubStrategy({
@@ -35,39 +61,45 @@ module.exports = function (app, myDataBase) {
     clientSecret: process.env.GITHUB_CLIENT_SECRET,
     callbackURL: "http://localhost:3000/auth/github/callback",
   },
-    function (accessToken, refreshToken, profile, cb) {
-      console.log(`-- Logged with github [${profile.displayName}]`);
-      //Database logic here with callback containing your user object
-      myDataBase.findOneAndUpdate(
-        { id: profile.id },
-        {
-          $setOnInsert: {
-            id: profile.id,
-            username: profile.username,
-            name: profile.displayName || 'John Doe',
-            photo: profile.photos[0].value || '',
-            email: Array.isArray(profile.emails)
-              ? profile.emails[0].value
-              : 'No public email',
-            created_on: new Date(),
-            provider: profile.provider || ''
+    async (accessToken, refreshToken, profile, cb) => {
+      try {
+        log(`-- Logged with github [${profile.displayName}]`);
+        //Database logic here with callback containing your user object
+        const user = await myDataBase.findOneAndUpdate(
+          { id: profile.id },
+          {
+            $setOnInsert: {
+              id: profile.id,
+              username: profile.username,
+              name: profile.displayName || 'John Doe',
+              photo: profile.photos[0].value || '',
+              email: Array.isArray(profile.emails)
+                ? profile.emails[0].value
+                : 'No public email',
+              created_on: new Date(),
+              provider: profile.provider || ''
+            },
+            $set: {
+              last_login: new Date()
+            },
+            $inc: {
+              login_count: 1
+            }
           },
-          $set: {
-            last_login: new Date()
-          },
-          $inc: {
-            login_count: 1
-          }
-        },
-        { upsert: true, new: true },
-        (err, doc) => {
-          if (err) {
-            console.error("Error at saving:", err);
-            return cb(err);
-          }
-          return cb(null, doc.value);
+          { upsert: true, new: true }
+        );
+        if (!user) {
+          console.log("** Eroor during findAndUpdate logging with github...");
+          return cb(null);
         }
-      );
+        log("--    update mongodb, continue: ", user.username);
+        return cb(null, user);
+      } catch (e) {
+        if (err) {
+          console.error("Error at saving:", err);
+          return cb(err);
+        }
+      }
     }
   ));
 }
